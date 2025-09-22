@@ -11,6 +11,9 @@ import uuid
 import shutil
 from pathlib import Path as SysPath
 
+# Pillow for real image editing
+from PIL import Image, ImageFilter, ImageOps
+
 # PUBLIC_INTERFACE
 class ProcessingStatus(str, Enum):
     """Status values for an image processing job."""
@@ -51,6 +54,55 @@ class ProcessRequest(BaseModel):
     params: Optional[Dict[str, str]] = Field(default_factory=dict, description="Parameters for the operation (e.g., angle=90).")
 
 
+# PUBLIC_INTERFACE
+class EditOperation(str, Enum):
+    """Supported edit operations."""
+    resize = "resize"
+    crop = "crop"
+    rotate = "rotate"
+    flip = "flip"
+    flop = "flop"
+    grayscale = "grayscale"
+    blur = "blur"
+    sharpen = "sharpen"
+    autocontrast = "autocontrast"
+
+
+# PUBLIC_INTERFACE
+class EditParams(BaseModel):
+    """Parameters for specific edit operations.
+
+    Depending on 'operation', relevant fields are:
+    - resize: width, height, keep_aspect (optional)
+    - crop: x, y, width, height
+    - rotate: angle, expand (optional)
+    - flip/flop: no params
+    - grayscale: no params
+    - blur: radius (float)
+    - sharpen: factor (float)  (uses ImageFilter.UnsharpMask)
+    - autocontrast: cutoff (float 0..100), ignore (optional)
+    """
+    width: Optional[int] = Field(None, description="Target width for resize or crop.")
+    height: Optional[int] = Field(None, description="Target height for resize or crop.")
+    keep_aspect: Optional[bool] = Field(True, description="Maintain aspect ratio for resize when one dimension is missing.")
+    x: Optional[int] = Field(None, description="Left coordinate for crop.")
+    y: Optional[int] = Field(None, description="Top coordinate for crop.")
+    angle: Optional[float] = Field(None, description="Rotation angle in degrees.")
+    expand: Optional[bool] = Field(True, description="Expand canvas to fit entire rotated image.")
+    radius: Optional[float] = Field(2.0, description="Blur radius for Gaussian blur.")
+    factor: Optional[float] = Field(1.5, description="Sharpen factor; used for unsharp mask.")
+    cutoff: Optional[float] = Field(0.0, description="Autocontrast cutoff percentage 0..100.")
+    ignore: Optional[List[int]] = Field(None, description="Values to ignore in autocontrast histogram, typically [0,255].")
+
+
+# PUBLIC_INTERFACE
+class EditRequest(BaseModel):
+    """JSON request describing an edit to apply to a stored image."""
+    operation: EditOperation = Field(..., description="Edit operation to apply.")
+    params: Optional[EditParams] = Field(None, description="Parameters for the edit operation.")
+    output_format: Optional[str] = Field(None, description="Optional output format override, e.g., 'PNG' or 'JPEG'.")
+
+
 # Simple in-memory store mocking a database layer. Replace with an actual DB later.
 class _ImageStore:
     def __init__(self, base_dir: str):
@@ -78,24 +130,106 @@ class _ImageStore:
         return ImageMeta(**record)
 
 
-# Minimal "processing" utilities. In real-life, use Pillow/OpenCV. Here we'll simulate.
+# Minimal "processing" utilities. In real-life, use Pillow/OpenCV. Here we'll simulate and add real edits.
+
 def _simulate_processing(source_path: SysPath, dest_path: SysPath, operation: str, params: Dict[str, str]):
     """
     Simulate image processing by copying the original file to processed path.
     For certain operations, we append small headers to indicate processing metadata.
     """
-    # For safety, ensure the source exists
     if not source_path.exists():
         raise FileNotFoundError("Source image not found for processing.")
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Simulate a processing change: copy file bytes; optionally prepend a small note
     with source_path.open("rb") as src, dest_path.open("wb") as dst:
         note = f"Processed-Op:{operation};Params:{params}\n".encode("utf-8")
-        # This is NOT a valid image transformation; only a placeholder to simulate processing.
-        # In a real system, replace with actual image transformation code.
         dst.write(note)
         shutil.copyfileobj(src, dst)
+
+
+def _apply_edit_pillow(src_path: SysPath, dst_path: SysPath, edit: EditRequest) -> Dict[str, int]:
+    """
+    Apply an image edit using Pillow and save to destination.
+    Returns resulting dimensions: {'width': int, 'height': int}
+    """
+    if not src_path.exists():
+        raise FileNotFoundError("Source image not found for editing.")
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with Image.open(src_path) as img:
+        op = edit.operation
+        p = edit.params or EditParams()
+
+        if op == EditOperation.resize:
+            # Determine target size
+            if p.width and p.height:
+                size = (p.width, p.height)
+            elif p.width and not p.height:
+                if p.keep_aspect:
+                    ratio = p.width / float(img.width)
+                    size = (p.width, int(img.height * ratio))
+                else:
+                    size = (p.width, img.height)
+            elif p.height and not p.width:
+                if p.keep_aspect:
+                    ratio = p.height / float(img.height)
+                    size = (int(img.width * ratio), p.height)
+                else:
+                    size = (img.width, p.height)
+            else:
+                raise HTTPException(status_code=400, detail="Resize requires width or height.")
+            img = img.resize(size)
+
+        elif op == EditOperation.crop:
+            if p.x is None or p.y is None or p.width is None or p.height is None:
+                raise HTTPException(status_code=400, detail="Crop requires x, y, width, height.")
+            left = int(max(0, p.x))
+            top = int(max(0, p.y))
+            right = int(min(img.width, left + p.width))
+            bottom = int(min(img.height, top + p.height))
+            if right <= left or bottom <= top:
+                raise HTTPException(status_code=400, detail="Crop region is empty or invalid.")
+            img = img.crop((left, top, right, bottom))
+
+        elif op == EditOperation.rotate:
+            if p.angle is None:
+                raise HTTPException(status_code=400, detail="Rotate requires angle.")
+            img = img.rotate(p.angle, expand=bool(p.expand))
+
+        elif op == EditOperation.flip:
+            img = ImageOps.flip(img)
+
+        elif op == EditOperation.flop:
+            img = ImageOps.mirror(img)
+
+        elif op == EditOperation.grayscale:
+            img = ImageOps.grayscale(img)
+
+        elif op == EditOperation.blur:
+            radius = float(p.radius or 2.0)
+            img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+        elif op == EditOperation.sharpen:
+            factor = float(p.factor or 1.5)
+            # Using UnsharpMask for controllable sharpening
+            img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=int(150 * factor), threshold=3))
+
+        elif op == EditOperation.autocontrast:
+            cutoff = float(p.cutoff or 0.0)
+            ignore = p.ignore
+            img = ImageOps.autocontrast(img, cutoff=cutoff, ignore=ignore)
+
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported edit operation: {op}")
+
+        # Save output
+        save_kwargs = {}
+        if edit.output_format:
+            fmt = edit.output_format.upper()
+        else:
+            fmt = img.format or "PNG"  # fallback if no format
+        img.save(dst_path, format=fmt, **save_kwargs)
+        return {"width": img.width, "height": img.height}
 
 
 def _get_env(name: str, default: str) -> str:
@@ -119,6 +253,7 @@ app = FastAPI(
         {"name": "images", "description": "Image upload, metadata, listing, and deletion."},
         {"name": "processing", "description": "Trigger and check image processing status."},
         {"name": "content", "description": "Retrieve original and processed image content."},
+        {"name": "editing", "description": "Image editing operations like crop, rotate, resize, filters."},
         {"name": "websocket", "description": "Real-time updates (reserved for future use)."},
     ],
 )
@@ -149,6 +284,14 @@ def _original_path(image_id: str, filename: str) -> SysPath:
 
 def _processed_path(image_id: str, filename: str) -> SysPath:
     return store.proc_dir / f"{image_id}__{filename}"
+
+
+def _edited_path(image_id: str, filename: str, suffix: str = "") -> SysPath:
+    """
+    Build a path for edited outputs. Suffix can be used to differentiate versions.
+    """
+    base = f"{image_id}__edited{suffix}__{filename}"
+    return store.proc_dir / base
 
 
 # Routes
@@ -378,6 +521,77 @@ def get_processed(image_id: str):
             yield from f
 
     # Media type remains original content_type for simplicity
+    return StreamingResponse(iterfile(), media_type=rec["content_type"])
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/api/images/{image_id}/edit",
+    tags=["editing"],
+    summary="Apply an edit operation to an image",
+    response_model=ImageMeta,
+    responses={
+        200: {"description": "Edit applied and stored."},
+        404: {"description": "Image not found."},
+        400: {"description": "Invalid parameters or unsupported operation."},
+    },
+)
+def edit_image(image_id: str, req: EditRequest):
+    """
+    Apply an image edit synchronously using Pillow and store the edited image in the processed directory.
+    The image metadata will be updated with the new width/height and status 'completed'.
+    """
+    rec = _ensure_exists(image_id)
+    src = _original_path(image_id, rec["filename"])
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="Original content not found")
+
+    # Build destination path (overwrite the "processed" location to be retrievable via /processed)
+    dst = _processed_path(image_id, rec["filename"])
+    try:
+        dims = _apply_edit_pillow(src, dst, req)
+        rec["status"] = ProcessingStatus.completed
+        rec["width"] = dims.get("width")
+        rec["height"] = dims.get("height")
+        rec["error"] = None
+    except HTTPException:
+        # pass through
+        raise
+    except Exception as e:
+        rec["status"] = ProcessingStatus.failed
+        rec["error"] = str(e)
+        rec["updated_at"] = datetime.utcnow()
+        store.upsert(rec)
+        raise HTTPException(status_code=400, detail=f"Edit failed: {e}")
+
+    rec["updated_at"] = datetime.utcnow()
+    store.upsert(rec)
+    return store.to_model(rec)
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/api/images/{image_id}/edited",
+    tags=["content"],
+    summary="Get last edited image bytes",
+    responses={
+        200: {"description": "Edited image content."},
+        404: {"description": "Edited content not available."},
+    },
+)
+def get_edited(image_id: str):
+    """
+    Return the last edited image (same as processed for now) as bytes.
+    """
+    rec = _ensure_exists(image_id)
+    dst = _processed_path(image_id, rec["filename"])
+    if not dst.exists():
+        raise HTTPException(status_code=404, detail="Edited content not available.")
+
+    def iterfile():
+        with dst.open("rb") as f:
+            yield from f
+
     return StreamingResponse(iterfile(), media_type=rec["content_type"])
 
 

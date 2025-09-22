@@ -28,8 +28,17 @@ Optional environment variables:
 - GET  /api/images/{image_id} -> ImageMeta
 - POST /api/images/{image_id}/process (JSON: {operation, params?}) -> 202 Accepted, ImageMeta
 - GET  /api/images/{image_id}/status -> ImageMeta
+- POST /api/images/{image_id}/edit (JSON: {operation, params?, output_format?}) -> 200 OK, ImageMeta
+  - operations: resize, crop, rotate, flip, flop, grayscale, blur, sharpen, autocontrast
+  - examples:
+    - {"operation":"resize","params":{"width":800}}
+    - {"operation":"crop","params":{"x":10,"y":10,"width":200,"height":200}}
+    - {"operation":"rotate","params":{"angle":90,"expand":true}}
+    - {"operation":"grayscale"}
+    - {"operation":"blur","params":{"radius":3}}
 - GET  /api/images/{image_id}/original -> bytes
 - GET  /api/images/{image_id}/processed -> bytes (after completed)
+- GET  /api/images/{image_id}/edited -> bytes (alias for processed of last edit)
 - DELETE /api/images/{image_id} -> 204 No Content
 - GET /api/docs/websocket-usage -> placeholder help
 
